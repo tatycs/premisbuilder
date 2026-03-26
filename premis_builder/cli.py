@@ -1,13 +1,19 @@
-# premis_builder_pkg/premis_builder/cli.py
+# premis_builder/cli.py
 # -----------------------------------------------------------------------------
 # Ponto de entrada (linha de comando) para gerar PREMIS 3.0 a partir de um CSV.
-# Funções-chave:
-#  - Leitura robusta do CSV (detecção de delimitador, remoção de BOM, strip).
-#  - Roteamento por entidade (object/event/agent/rights) com filtros mínimos
-#    para não criar elementos "fantasmas" (vazios).
-#  - Escrita do XML com indentação (pretty print).
 #
-# Uso:
+# Este módulo é o "maestro" do programa: ele lê o CSV, identifica que tipo de
+# entidade PREMIS cada linha representa e chama o construtor correspondente.
+# Ao final, grava o XML resultante com indentação legível (pretty print).
+#
+# Funções principais:
+#   write_pretty_xml() → grava o XML indentado no disco
+#   _read_rows()       → lê e normaliza o CSV de entrada
+#   _has_min_*()       → verifica se uma linha tem dados suficientes para gerar
+#                        um elemento PREMIS sem deixá-lo vazio
+#   main()             → orquestra tudo: lê CSV → constrói XML → grava arquivo
+#
+# Uso na linha de comando:
 #   python premis_builder_cli.py <entrada.csv> <saida.xml>
 # -----------------------------------------------------------------------------
 
@@ -16,6 +22,7 @@ import sys
 import xml.etree.ElementTree as ET
 from xml.dom import minidom
 
+# Importa os namespaces e os construtores de cada entidade PREMIS
 from .utils import NS
 from .object_builder import build_object
 from .event_builder import build_event
@@ -23,139 +30,196 @@ from .agent_builder import build_agent
 from .rights_builder import build_rights
 
 
-# -----------------------------------------------------------------------------
-# Escrita "pretty" do XML (tenta ET.indent; se faltar, usa minidom)
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Escrita do XML com indentação (pretty print)
+# =============================================================================
+
 def write_pretty_xml(root_el: ET.Element, out_path: str):
     """
-    Grava o XML com indentação legível.
-    - Em Python 3.9+: usa ET.indent().
-    - Caso contrário, recorre ao minidom.toprettyxml().
+    Grava o XML com indentação legível no arquivo indicado por 'out_path'.
+
+    Estratégia:
+      - Python 3.9+: usa ET.indent(), que é a forma nativa e eficiente.
+      - Python < 3.9: usa minidom.toprettyxml() como alternativa (mais lento,
+        mas funcional em versões mais antigas).
+
+    Parâmetros:
+        root_el  — elemento raiz do XML (o <premis>)
+        out_path — caminho do arquivo de saída (ex.: "saida.xml")
     """
     try:
         tree = ET.ElementTree(root_el)
-        # Disponível em Python 3.9+
+        # ET.indent() disponível a partir do Python 3.9
         ET.indent(tree, space="  ", level=0)
         tree.write(out_path, encoding="utf-8", xml_declaration=True)
     except AttributeError:
+        # Fallback para Python < 3.9: converte para string e usa minidom
         rough = ET.tostring(root_el, encoding="utf-8")
         pretty = minidom.parseString(rough).toprettyxml(indent="  ", encoding="utf-8")
         with open(out_path, "wb") as f:
             f.write(pretty)
 
 
-# -----------------------------------------------------------------------------
-# Leitura robusta do CSV
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Leitura e normalização do CSV
+# =============================================================================
+
 def _read_rows(path):
     """
-    Lê o CSV:
-      - Detecta delimitador com csv.Sniffer (fallback: vírgula).
-      - Remove BOM (utf-8-sig).
-      - Normaliza espaços em headers/valores.
-      - Garante que cada linha tenha o mesmo número de colunas que o cabeçalho.
+    Lê o arquivo CSV de forma robusta e retorna os dados normalizados.
+
+    Cuidados aplicados:
+      - Detecta automaticamente o delimitador (vírgula, ponto-e-vírgula, tab...)
+        usando csv.Sniffer. Se a detecção falhar, usa vírgula como padrão.
+      - Remove o BOM (Byte Order Mark) que editores como Excel adicionam ao
+        início de arquivos UTF-8 (caractere invisível \ufeff).
+      - Normaliza espaços extras em cabeçalhos e valores (str.strip()).
+      - Garante que todas as linhas tenham o mesmo número de colunas que o
+        cabeçalho (completa com "" ou trunca, conforme necessário).
 
     Retorna:
-      (headers: list[str], rows: list[list[(header, value)]])
+        (headers, rows) onde:
+          headers — lista de strings com os nomes das colunas
+          rows    — lista de linhas; cada linha é uma lista de tuplas (header, valor)
     """
     with open(path, "r", encoding="utf-8-sig", newline="") as f:
+        # Lê uma amostra para detectar o delimitador do CSV
         sample = f.read(2048)
-        f.seek(0)
+        f.seek(0)  # volta ao início do arquivo após ler a amostra
         try:
             dialect = csv.Sniffer().sniff(sample)
         except Exception:
-            dialect = csv.excel  # fallback: vírgula
+            dialect = csv.excel  # fallback: usa vírgula como delimitador
         reader = csv.reader(f, dialect)
         rows = list(reader)
 
     if not rows:
-        return [], []
+        return [], []  # arquivo vazio
 
-    # Normaliza cabeçalhos (strip + remove BOM residual)
+    # Linha 0 = cabeçalho; remove BOM residual e espaços
     headers = [str(h).strip().lstrip("\ufeff") for h in rows[0]]
-    data = rows[1:]
+    data = rows[1:]  # demais linhas são dados
 
     norm = []
     for r in data:
-        # Equaliza comprimento ao dos headers
+        # Equaliza o comprimento da linha ao número de colunas do cabeçalho
         if len(r) < len(headers):
-            r = r + [""] * (len(headers) - len(r))
+            r = r + [""] * (len(headers) - len(r))   # completa com vazio
         elif len(r) > len(headers):
-            r = r[:len(headers)]
-        # Strip por célula
+            r = r[:len(headers)]                       # trunca o excesso
+
+        # Remove espaços de cada célula individualmente
         r = [str(v).strip() for v in r]
+
+        # Transforma a linha em lista de tuplas (cabeçalho, valor)
         pairs = list(zip(headers, r))
         norm.append(pairs)
 
     return headers, norm
 
 
-# -----------------------------------------------------------------------------
-# Predicados mínimos por entidade (evitam gerar elementos "vazios")
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Predicados mínimos por entidade
+# (evitam criar elementos PREMIS "fantasmas" com tudo vazio)
+# =============================================================================
+
 def _any_filled(pairs, prefix: str) -> bool:
-    """Há algum campo com nome começando por 'prefix' com valor não-vazio?"""
+    """
+    Retorna True se houver ao menos um campo cujo nome começa com 'prefix'
+    e cujo valor seja não-vazio.
+
+    Usado como critério alternativo quando os campos principais (Type+Value)
+    não estão preenchidos mas outros campos da entidade estão.
+    """
     return any(k.startswith(prefix) and str(v).strip() for k, v in pairs)
+
 
 def _has_min_object(pairs) -> bool:
     """
-    Critério mínimo para construir <object>:
-      - preferencial: ob.objectIdentifierType + ob.objectIdentifierValue
-      - (facultativo) ob.xsi_type ou ob.objectCategory podem existir, mas não são obrigatórios
-      - alternativa: qualquer ob.* preenchido (para casos muito parciais)
+    Verifica se a linha tem dados suficientes para construir um <object>.
+
+    Critério preferencial: ter ob.objectIdentifierType E ob.objectIdentifierValue.
+    Critério alternativo:  qualquer campo "ob.*" preenchido (casos parciais).
     """
     has_type  = any(k == "ob.objectIdentifierType"  and str(v).strip() for k, v in pairs)
     has_value = any(k == "ob.objectIdentifierValue" and str(v).strip() for k, v in pairs)
     return (has_type and has_value) or _any_filled(pairs, "ob.")
 
+
 def _has_min_event(pairs) -> bool:
     """
-    Critério mínimo para construir <event>:
-      - preferencial: ev.eventIdentifierType + ev.eventIdentifierValue
-      - alternativa: qualquer ev.* preenchido
+    Verifica se a linha tem dados suficientes para construir um <event>.
+
+    Critério preferencial: ter ev.eventIdentifierType E ev.eventIdentifierValue.
+    Critério alternativo:  qualquer campo "ev.*" preenchido.
     """
     has_type  = any(k == "ev.eventIdentifierType"  and str(v).strip() for k, v in pairs)
     has_value = any(k == "ev.eventIdentifierValue" and str(v).strip() for k, v in pairs)
     return (has_type and has_value) or _any_filled(pairs, "ev.")
 
+
 def _has_min_agent(pairs) -> bool:
     """
-    Critério mínimo para construir <agent>:
-      - preferencial: ag.agentIdentifierType + ag.agentIdentifierValue
-      - alternativa: qualquer ag.* preenchido
+    Verifica se a linha tem dados suficientes para construir um <agent>.
+
+    Critério preferencial: ter ag.agentIdentifierType E ag.agentIdentifierValue.
+    Critério alternativo:  qualquer campo "ag.*" preenchido.
     """
     has_type  = any(k == "ag.agentIdentifierType"  and str(v).strip() for k, v in pairs)
     has_value = any(k == "ag.agentIdentifierValue" and str(v).strip() for k, v in pairs)
     return (has_type and has_value) or _any_filled(pairs, "ag.")
 
+
 def _has_min_rights(pairs) -> bool:
     """
-    Critério mínimo para construir <rights> (rightsStatement):
-      - preferencial: rt.rightsStatementIdentifierType + rt.rightsStatementIdentifierValue
-      - alternativa: qualquer rt.* preenchido
+    Verifica se a linha tem dados suficientes para construir um <rights>.
+
+    Critério preferencial: ter rt.rightsStatementIdentifierType E rt.rightsStatementIdentifierValue.
+    Critério alternativo:  qualquer campo "rt.*" preenchido.
     """
     has_type  = any(k == "rt.rightsStatementIdentifierType"  and str(v).strip() for k, v in pairs)
     has_value = any(k == "rt.rightsStatementIdentifierValue" and str(v).strip() for k, v in pairs)
     return (has_type and has_value) or _any_filled(pairs, "rt.")
 
 
-# -----------------------------------------------------------------------------
-# main(): orquestra a leitura, construção e escrita do XML
-# -----------------------------------------------------------------------------
+# =============================================================================
+# Função principal
+# =============================================================================
+
 def main():
+    """
+    Função principal do programa. Executada quando o usuário chama:
+        python premis_builder_cli.py entrada.csv saida.xml
+
+    Fluxo:
+      1. Valida os argumentos da linha de comando.
+      2. Registra os namespaces XML (premis, xlink, xsi).
+      3. Cria o elemento raiz <premis version="3.0">.
+      4. Lê e normaliza o CSV.
+      5. Para cada linha do CSV:
+           a. Pula linhas totalmente vazias.
+           b. Lê o valor da coluna "entity" para saber o tipo de entidade.
+           c. Verifica se há dados mínimos para a entidade.
+           d. Chama o construtor correspondente (build_object, build_event, etc.).
+      6. Grava o XML com indentação no arquivo de saída.
+    """
+
+    # Verifica se o usuário passou os dois argumentos obrigatórios
     if len(sys.argv) < 3:
         print("Uso: premis_builder_cli.py <entrada.csv> <saida.xml>")
         sys.exit(1)
 
-    in_csv = sys.argv[1]
-    out_xml = sys.argv[2]
+    in_csv  = sys.argv[1]  # arquivo CSV de entrada
+    out_xml = sys.argv[2]  # arquivo XML de saída
 
-    # Registra prefixos de namespace explícitos (premis, xlink, xsi)
+    # Registra os prefixos de namespace para que o XML gerado use
+    # "premis:", "xlink:" e "xsi:" em vez de notação Clark ({uri}tag)
     ET.register_namespace("premis", NS["premis"])
-    ET.register_namespace("xlink", NS["xlink"])
-    ET.register_namespace("xsi", NS["xsi"])
+    ET.register_namespace("xlink",  NS["xlink"])
+    ET.register_namespace("xsi",    NS["xsi"])
 
-    # Cria a raiz PREMIS com prefixo e atributos recomendados (versão 3.0)
+    # Cria o elemento raiz <premis> com os atributos padrão PREMIS 3.0:
+    #   version="3.0" e xsi:schemaLocation apontando para o XSD oficial
     premis_root = ET.Element(f"{{{NS['premis']}}}premis", {
         "version": "3.0",
         f"{{{NS['xsi']}}}schemaLocation": (
@@ -163,43 +227,53 @@ def main():
         ),
     })
 
+    # Lê e normaliza o CSV
     headers, rows = _read_rows(in_csv)
+
     if not rows:
-        # Grava pelo menos o <premis/> vazio
+        # CSV vazio: grava apenas o <premis/> sem filhos e encerra
         write_pretty_xml(premis_root, out_xml)
         return
 
+    # Processa cada linha do CSV
     for pairs in rows:
-        # Pula linhas totalmente vazias
+
+        # Ignora linhas onde TODOS os valores estão vazios
         if not any(v for _, v in pairs):
             continue
 
-        # Descobre a entidade (default: object)
+        # Lê o valor da coluna "entity" para determinar o tipo de entidade.
+        # Se a coluna não existir ou estiver vazia, assume "object".
         d = {str(k).strip(): v for k, v in pairs}
         entity = str(d.get("entity", "object")).strip().lower()
 
         if entity == "object":
+            # Constrói um <object> se houver dados mínimos
             if _has_min_object(pairs):
                 build_object(premis_root, pairs)
 
         elif entity == "event":
+            # Constrói um <event> se houver dados mínimos
             if _has_min_event(pairs):
                 build_event(premis_root, pairs)
 
         elif entity == "agent":
+            # Constrói um <agent> se houver dados mínimos
             if _has_min_agent(pairs):
                 build_agent(premis_root, pairs)
 
         elif entity == "rights":
+            # Constrói um <rights> se houver dados mínimos
             if _has_min_rights(pairs):
                 build_rights(premis_root, pairs)
 
         else:
-            # Entidade desconhecida: trate como object se houver dados mínimos
+            # Entidade desconhecida: trata como <object> se houver dados mínimos
+            # (comportamento de segurança para não perder dados)
             if _has_min_object(pairs):
                 build_object(premis_root, pairs)
 
-    # Escrita indentada do XML
+    # Grava o XML final com indentação legível
     write_pretty_xml(premis_root, out_xml)
 
 
