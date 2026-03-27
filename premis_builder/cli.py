@@ -66,7 +66,7 @@ def write_pretty_xml(root_el: ET.Element, out_path: str):
 
 def _read_rows(path):
     """
-    Lê o arquivo CSV de forma robusta e retorna os dados normalizados.
+    Lê o arquivo CSV e retorna os dados normalizados.
 
     Cuidados aplicados:
       - Detecta automaticamente o delimitador (vírgula, ponto-e-vírgula, tab...)
